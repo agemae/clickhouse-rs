@@ -219,6 +219,10 @@ pub struct Options {
     /// Access password (defaults to `""`).
     pub(crate) password: String,
 
+    /// Certificate path
+    #[cfg(feature = "tls")]
+    pub(crate) certificate_path: Option<String>,
+
     /// Enable compression (defaults to `false`).
     pub(crate) compression: bool,
 
@@ -319,6 +323,8 @@ impl Default for Options {
             skip_verify: false,
             #[cfg(feature = "tls")]
             certificate: None,
+            #[cfg(feature = "tls")]
+            certificate_path: None,
             settings: HashMap::new(),
             alt_hosts: Vec::new(),
         }
@@ -465,6 +471,11 @@ impl Options {
     property! {
         /// Skip certificate verification (default is `false`).
         => skip_verify: bool
+    }
+
+    #[cfg(feature= "tls")]
+    property! {
+        => certificate_path: Option<String>
     }
 
     #[cfg(feature = "tls")]
