@@ -67,19 +67,25 @@ pub(crate) struct Progress {
 ///
 /// See <https://clickhouse.com/docs/native-protocol/server#profileinfo>.
 #[derive(Copy, Clone, Default, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ProfileInfo {
     /// Rows in the result sent to the client.
     pub rows: u64,
-    /// Bytes in the result sent to the client.
+    /// Uncompressed in-memory size of the result blocks. Not the number of bytes sent over
+    /// the network, so don't use it for transfer metrics.
     pub bytes: u64,
     /// Blocks in the result sent to the client.
     pub blocks: u64,
-    /// Whether the outermost query applied a `LIMIT`.
+    /// Whether a `LIMIT` was applied anywhere in the query, including in a subquery.
     pub applied_limit: bool,
-    /// Rows the query produced before its `LIMIT` was applied. Only meaningful when
-    /// `applied_limit` is true.
+    /// Rows before the `LIMIT` was applied. Only meaningful when `applied_limit` is true.
+    ///
+    /// Under default settings this is a lower bound: the server may stop reading once it has
+    /// enough rows, so `rows_before_limit > rows` can miss truncated results. Set
+    /// `exact_rows_before_limit = 1` on the query for an exact count; the server then reads all
+    /// the data before the `LIMIT` instead of stopping early.
     pub rows_before_limit: u64,
-    /// Whether the server computed `rows_before_limit`.
+    /// Always `true` from current servers, even without a `LIMIT`. Use `applied_limit` instead.
     pub calculated_rows_before_limit: bool,
 }
 

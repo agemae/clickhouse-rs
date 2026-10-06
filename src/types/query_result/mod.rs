@@ -84,12 +84,14 @@ impl<'a> QueryResult<'a> {
         let query = self.query.clone();
 
         self.client
-            .wrap_stream::<'a, _>(move |c: &'a mut ClientHandle| {
+            .wrap_stream::<'a, _, _>(move |c: &'a mut ClientHandle| async move {
                 info!("[send query] {}", query.get_sql());
 
                 let context = c.context.clone();
 
-                let inner = c.get_inner()?.call(Cmd::SendQuery(query, context));
+                // Drain packets left over from a stream that was dropped before its end.
+                let transport = c.get_inner()?.clear().await?;
+                let inner = transport.call(Cmd::SendQuery(query, context));
 
                 Ok(BlockStream::<'a>::new(c, inner, skip_first_block))
             })

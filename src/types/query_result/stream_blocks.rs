@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use crate::{
     errors::{DriverError, Error, Result},
     io::transport::PacketStream,
-    types::{Block, Packet},
+    types::{Block, Packet, ProfileInfo},
     ClientHandle,
 };
 
@@ -21,6 +21,7 @@ pub(crate) struct BlockStream<'a> {
     state: BlockStreamState,
     block_index: usize,
     skip_first_block: bool,
+    profile_info: Option<ProfileInfo>,
 }
 
 #[derive(Clone, Copy)]
@@ -62,6 +63,7 @@ impl<'a> BlockStream<'a> {
             state: BlockStreamState::Reading,
             block_index: 0,
             skip_first_block,
+            profile_info: None,
         }
     }
 }
@@ -96,11 +98,14 @@ impl<'a> Stream for BlockStream<'a> {
             match packet {
                 Packet::Eof(inner) => {
                     self.client.inner = Some(inner);
+                    self.client.last_profile_info = self.profile_info.take();
                     self.state = BlockStreamState::Finished;
                 }
-                Packet::ProfileInfo(info) => self.client.last_profile_info = Some(info),
+                Packet::ProfileInfo(info) => self.profile_info = Some(info),
                 Packet::Progress(_) => {}
                 Packet::Exception(exception) => {
+                    // Exception is the last packet of the query; the connection is idle again.
+                    self.client.inner = self.inner.take_transport();
                     self.state = BlockStreamState::Finished;
                     return Poll::Ready(Some(Err(Error::Server(exception))));
                 }

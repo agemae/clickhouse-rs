@@ -359,10 +359,12 @@ impl ClientHandle {
         .await
     }
 
-    /// `ProfileInfo` from the most recent query on this handle, if the server sent one.
+    /// `ProfileInfo` of the last [`query`](Self::query) result on this handle that was read to
+    /// end of stream (`fetch_all`, or `stream`/`stream_blocks` drained to `None`).
     ///
-    /// Reset when a new query, execute, or insert starts, and set once the result stream
-    /// receives the packet (just before end of stream), so read it after the stream is drained.
+    /// Cleared when the next `query`, `execute` or `insert` starts. Stays `None` if the result
+    /// failed, was dropped or timed out before end of stream, or the server sent no
+    /// `ProfileInfo`. `execute` and `insert` never set it.
     pub fn last_profile_info(&self) -> Option<ProfileInfo> {
         self.last_profile_info
     }
@@ -372,7 +374,6 @@ impl ClientHandle {
     where
         Query: From<Q>,
     {
-        self.last_profile_info = None;
         let query = Query::from(sql);
         QueryResult {
             client: self,
@@ -385,7 +386,6 @@ impl ClientHandle {
     where
         Query: From<Q>,
     {
-        self.last_profile_info = None;
         let transport = self.execute_(sql).await?;
         self.inner = Some(transport);
         Ok(())
@@ -442,7 +442,6 @@ impl ClientHandle {
         Query: From<Q>,
         B: AsRef<Block>,
     {
-        self.last_profile_info = None;
         let query = Self::make_query(table, block.as_ref())?;
         let transport = self.insert_(query.clone(), block.as_ref()).await?;
         self.inner = Some(transport);
@@ -538,6 +537,8 @@ impl ClientHandle {
         R: Future<Output = Result<T>>,
         T: 'static,
     {
+        // `execute` and `insert` start here, so this is where they clear the last ProfileInfo.
+        self.last_profile_info = None;
         // let ping_before_query = try_opt!(self.context.options.get()).ping_before_query;
 
         // if ping_before_query {
@@ -546,10 +547,13 @@ impl ClientHandle {
         f(self).await
     }
 
-    pub(crate) fn wrap_stream<'a, F>(&'a mut self, f: F) -> BoxStream<'a, Result<Block>>
+    pub(crate) fn wrap_stream<'a, F, R>(&'a mut self, f: F) -> BoxStream<'a, Result<Block>>
     where
-        F: (FnOnce(&'a mut Self) -> Result<BlockStream<'a>>) + Send + 'static,
+        F: (FnOnce(&'a mut Self) -> R) + Send + 'static,
+        R: Future<Output = Result<BlockStream<'a>>> + Send + 'a,
     {
+        // Every `query` result stream starts here; `BlockStream` sets the value on end of stream.
+        self.last_profile_info = None;
         // let ping_before_query = match self.context.options.get() {
         //     Ok(val) => val.ping_before_query,
         //     Err(err) => return Box::pin(stream::once(future::err(err))),
@@ -569,10 +573,16 @@ impl ClientHandle {
 
         //     Box::pin(fut.flatten_stream())
         // } else {
-            match f(self) {
-                Ok(s) => Box::pin(s),
-                Err(err) => Box::pin(stream::once(future::err(err))),
+        let fut = f(self);
+        Box::pin(
+            async move {
+                match fut.await {
+                    Ok(s) => s.boxed(),
+                    Err(err) => stream::once(future::err(err)).boxed(),
+                }
             }
+            .flatten_stream(),
+        )
         // }
     }
 

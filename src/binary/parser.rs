@@ -169,6 +169,12 @@ impl<'i, T: Read> Parser<'i, T> {
             message: self.reader.read_string()?,
             stack_trace: self.reader.read_string()?,
         };
+        // The server ends each exception with a `has_nested` flag (and a nested exception if
+        // set). Read it so the transport stays in sync and can be reused for the next query.
+        let has_nested: bool = self.reader.read_scalar()?;
+        if has_nested {
+            self.parse_exception()?;
+        }
 
         warn!("server exception: {:?}", exception);
         Ok(Packet::Exception(exception))

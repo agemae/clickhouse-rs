@@ -101,7 +101,11 @@ impl ClickhouseTransport {
                     h = Some(inner);
                 }
                 Ok(Packet::Eof(inner)) => h = Some(inner),
-                Ok(Packet::Exception(e)) => return Err(Error::Server(e)),
+                // The abandoned query failed; that also ends it, so the connection is idle.
+                Ok(Packet::Exception(_)) => {
+                    h = stream.take_transport();
+                    break;
+                }
                 Err(e) => return Err(Error::Io(e)),
                 _ => {}
             }
