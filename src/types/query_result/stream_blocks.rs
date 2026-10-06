@@ -98,7 +98,8 @@ impl<'a> Stream for BlockStream<'a> {
                     self.client.inner = Some(inner);
                     self.state = BlockStreamState::Finished;
                 }
-                Packet::ProfileInfo(_) | Packet::Progress(_) => {}
+                Packet::ProfileInfo(info) => self.client.last_profile_info = Some(info),
+                Packet::Progress(_) => {}
                 Packet::Exception(exception) => {
                     self.state = BlockStreamState::Finished;
                     return Poll::Ready(Some(Err(Error::Server(exception))));

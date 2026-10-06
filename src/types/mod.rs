@@ -63,13 +63,23 @@ pub(crate) struct Progress {
     pub written_bytes: u64,
 }
 
+/// Query execution summary sent by the server in the `ProfileInfo` packet.
+///
+/// See <https://clickhouse.com/docs/native-protocol/server#profileinfo>.
 #[derive(Copy, Clone, Default, Debug, PartialEq)]
-pub(crate) struct ProfileInfo {
+pub struct ProfileInfo {
+    /// Rows in the result sent to the client.
     pub rows: u64,
+    /// Bytes in the result sent to the client.
     pub bytes: u64,
+    /// Blocks in the result sent to the client.
     pub blocks: u64,
+    /// Whether the outermost query applied a `LIMIT`.
     pub applied_limit: bool,
+    /// Rows the query produced before its `LIMIT` was applied. Only meaningful when
+    /// `applied_limit` is true.
     pub rows_before_limit: u64,
+    /// Whether the server computed `rows_before_limit`.
     pub calculated_rows_before_limit: bool,
 }
 

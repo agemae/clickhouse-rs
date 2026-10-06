@@ -123,7 +123,7 @@ use crate::{
     types::{
         block::{ChunkIterator, INSERT_BLOCK_SIZE},
         query_result::stream_blocks::BlockStream,
-        Cmd, Context, IntoOptions, OptionsSource, Packet, Query, QueryResult, SqlType,
+        Cmd, Context, IntoOptions, OptionsSource, Packet, ProfileInfo, Query, QueryResult, SqlType,
     },
 };
 pub use crate::{
@@ -235,6 +235,7 @@ pub struct Client {
 pub struct ClientHandle {
     inner: Option<ClickhouseTransport>,
     context: Context,
+    last_profile_info: Option<ProfileInfo>,
 }
 
 impl fmt::Debug for ClientHandle {
@@ -277,6 +278,7 @@ impl Client {
                 let mut handle = ClientHandle {
                     inner: Some(transport),
                     context,
+                    last_profile_info: None,
                 };
 
                 handle.hello().await?;
@@ -357,11 +359,20 @@ impl ClientHandle {
         .await
     }
 
+    /// `ProfileInfo` from the most recent query on this handle, if the server sent one.
+    ///
+    /// Reset when a new query, execute, or insert starts, and set once the result stream
+    /// receives the packet (just before end of stream), so read it after the stream is drained.
+    pub fn last_profile_info(&self) -> Option<ProfileInfo> {
+        self.last_profile_info
+    }
+
     /// Executes Clickhouse `query` on Conn.
     pub fn query<Q>(&mut self, sql: Q) -> QueryResult
     where
         Query: From<Q>,
     {
+        self.last_profile_info = None;
         let query = Query::from(sql);
         QueryResult {
             client: self,
@@ -374,6 +385,7 @@ impl ClientHandle {
     where
         Query: From<Q>,
     {
+        self.last_profile_info = None;
         let transport = self.execute_(sql).await?;
         self.inner = Some(transport);
         Ok(())
@@ -430,6 +442,7 @@ impl ClientHandle {
         Query: From<Q>,
         B: AsRef<Block>,
     {
+        self.last_profile_info = None;
         let query = Self::make_query(table, block.as_ref())?;
         let transport = self.insert_(query.clone(), block.as_ref()).await?;
         self.inner = Some(transport);
