@@ -10,6 +10,9 @@ use crate::{
     types::{Block, Packet, ProfileInfo, Progress, ServerInfo, TableColumns},
 };
 
+/// Current servers never nest exceptions; this only bounds what a misbehaving peer can send.
+const MAX_NESTED_EXCEPTIONS: usize = 16;
+
 /// The internal clickhouse response parser.
 pub(crate) struct Parser<'i, T> {
     reader: T,
@@ -163,21 +166,39 @@ impl<'i, T: Read> Parser<'i, T> {
     }
 
     fn parse_exception(&mut self) -> Result<Packet<()>> {
-        let exception = ServerError {
+        let mut exception = self.read_exception()?;
+        // Each exception ends with a `has_nested` flag, followed by the nested exception when
+        // it's set. Reading the whole chain keeps the transport in sync, so the connection can
+        // be reused. A capped loop rather than recursion, so a malformed chain can't overflow
+        // the stack; nested messages are kept by appending them to `message`.
+        let mut has_nested: bool = self.reader.read_scalar()?;
+        let mut depth = 0;
+        while has_nested {
+            depth += 1;
+            if depth > MAX_NESTED_EXCEPTIONS {
+                return Err(Error::Driver(DriverError::Deserialize(
+                    "server exception nests too deeply".into(),
+                )));
+            }
+            let nested = self.read_exception()?;
+            exception.message.push_str(&format!(
+                "\nCaused by: Code: {}. {}",
+                nested.code, nested.message
+            ));
+            has_nested = self.reader.read_scalar()?;
+        }
+
+        warn!("server exception: {:?}", exception);
+        Ok(Packet::Exception((), exception))
+    }
+
+    fn read_exception(&mut self) -> Result<ServerError> {
+        Ok(ServerError {
             code: self.reader.read_scalar()?,
             name: self.reader.read_string()?,
             message: self.reader.read_string()?,
             stack_trace: self.reader.read_string()?,
-        };
-        // The server ends each exception with a `has_nested` flag (and a nested exception if
-        // set). Read it so the transport stays in sync and can be reused for the next query.
-        let has_nested: bool = self.reader.read_scalar()?;
-        if has_nested {
-            self.parse_exception()?;
-        }
-
-        warn!("server exception: {:?}", exception);
-        Ok(Packet::Exception(exception))
+        })
     }
 
     fn parse_pong(&self) -> Packet<()> {

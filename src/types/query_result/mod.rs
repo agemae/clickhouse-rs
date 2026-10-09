@@ -8,6 +8,7 @@ use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
     errors::Result,
+    io::ClickhouseTransport,
     try_opt,
     types::{
         block::BlockRef, query_result::stream_blocks::BlockStream, Block, Cmd, Complex, Query, Row,
@@ -90,8 +91,8 @@ impl<'a> QueryResult<'a> {
                 let context = c.context.clone();
 
                 // Drain packets left over from a stream that was dropped before its end.
-                let transport = c.get_inner()?.clear().await?;
-                let inner = transport.call(Cmd::SendQuery(query, context));
+                ClickhouseTransport::clear_in(&mut c.inner).await?;
+                let inner = c.get_inner()?.call(Cmd::SendQuery(query, context));
 
                 Ok(BlockStream::<'a>::new(c, inner, skip_first_block))
             })

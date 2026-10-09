@@ -69,7 +69,9 @@ pub(crate) struct Progress {
 #[derive(Copy, Clone, Default, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct ProfileInfo {
-    /// Rows in the result sent to the client.
+    /// Rows in the result sent to the client, not counting the `WITH TOTALS` and `extremes`
+    /// rows. This crate returns those as ordinary data rows, so compare `rows_before_limit`
+    /// with this field rather than with the number of rows received.
     pub rows: u64,
     /// Uncompressed in-memory size of the result blocks. Not the number of bytes sent over
     /// the network, so don't use it for transfer metrics.
@@ -168,7 +170,7 @@ pub(crate) enum Packet<S> {
     Progress(Progress),
     ProfileInfo(ProfileInfo),
     TableColumns(TableColumns),
-    Exception(ServerError),
+    Exception(S, ServerError),
     Block(Block),
     Eof(S),
 }
@@ -181,7 +183,7 @@ impl<S> fmt::Debug for Packet<S> {
             Packet::Progress(p) => write!(f, "Progress({p:?})"),
             Packet::ProfileInfo(info) => write!(f, "ProfileInfo({info:?})"),
             Packet::TableColumns(info) => write!(f, "TableColumns({info:?})"),
-            Packet::Exception(e) => write!(f, "Exception({e:?})"),
+            Packet::Exception(_, e) => write!(f, "Exception({e:?})"),
             Packet::Block(b) => write!(f, "Block({b:?})"),
             Packet::Eof(_) => write!(f, "Eof"),
         }
@@ -196,7 +198,11 @@ impl<S> Packet<S> {
             Packet::Progress(progress) => Packet::Progress(progress),
             Packet::ProfileInfo(profile_info) => Packet::ProfileInfo(profile_info),
             Packet::TableColumns(table_columns) => Packet::TableColumns(table_columns),
-            Packet::Exception(exception) => Packet::Exception(exception),
+            // An `Exception` is the last packet of a query, so the connection is idle again
+            // and goes to whoever handles the error, like it does with `Eof`.
+            Packet::Exception(_, exception) => {
+                Packet::Exception(transport.take().unwrap(), exception)
+            }
             Packet::Block(block) => Packet::Block(block),
             Packet::Eof(_) => Packet::Eof(transport.take().unwrap()),
         }

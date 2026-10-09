@@ -84,7 +84,12 @@ impl<'a> Stream for BlockStream<'a> {
             };
 
             let packet = match self.inner.poll_next_unpin(cx) {
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err.into()))),
+                // A read or decode error leaves the connection out of sync with the server, so
+                // it must not go back on the handle, or the next query would read what's left.
+                Poll::Ready(Some(Err(err))) => {
+                    self.state = BlockStreamState::Error;
+                    return Poll::Ready(Some(Err(err.into())));
+                }
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
                     self.state = BlockStreamState::Error;
@@ -103,9 +108,9 @@ impl<'a> Stream for BlockStream<'a> {
                 }
                 Packet::ProfileInfo(info) => self.profile_info = Some(info),
                 Packet::Progress(_) => {}
-                Packet::Exception(exception) => {
+                Packet::Exception(inner, exception) => {
                     // Exception is the last packet of the query; the connection is idle again.
-                    self.client.inner = self.inner.take_transport();
+                    self.client.inner = Some(inner);
                     self.state = BlockStreamState::Finished;
                     return Poll::Ready(Some(Err(Error::Server(exception))));
                 }
@@ -115,7 +120,10 @@ impl<'a> Stream for BlockStream<'a> {
                         return Poll::Ready(Some(Ok(block)));
                     }
                 }
-                _ => return Poll::Ready(Some(Err(Error::Driver(DriverError::UnexpectedPacket)))),
+                _ => {
+                    self.state = BlockStreamState::Error;
+                    return Poll::Ready(Some(Err(Error::Driver(DriverError::UnexpectedPacket))));
+                }
             }
         }
     }

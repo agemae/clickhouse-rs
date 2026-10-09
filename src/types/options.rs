@@ -277,6 +277,9 @@ pub struct Options {
     pub(crate) keepalive: Option<Duration>,
 
     /// Ping server every time before execute any query. (defaults to `true`)
+    ///
+    /// Currently ignored: no ping is sent before queries. Pool-level health checks have to
+    /// call `ClientHandle::ping` themselves.
     pub(crate) ping_before_query: bool,
     /// Count of retry to send request to server. (defaults to `3`)
     pub(crate) send_retries: usize,
@@ -467,6 +470,9 @@ impl Options {
 
     property! {
         /// Ping server every time before execute any query. (defaults to `true`).
+        ///
+        /// Currently ignored: no ping is sent before queries. Call `ClientHandle::ping` to
+        /// check a pooled handle before reusing it.
         => ping_before_query: bool
     }
 

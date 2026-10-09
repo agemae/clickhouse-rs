@@ -18,18 +18,22 @@ use pin_project::pin_project;
 
 use crate::{
     binary::Parser,
-    errors::{DriverError, Error, Result},
+    errors::{ConnectionError, DriverError, Error, Result, ServerError},
     io::{read_to_end::read_to_end, Stream as InnerStream},
     types::{Block, Cmd, Packet},
 };
 use futures_core::Stream;
-use futures_util::StreamExt;
+use futures_util::{future, StreamExt};
 
 pub(crate) struct TransportInfo {
     pub(crate) timezone: Option<Tz>,
     pub(crate) revision: u64,
     pub(crate) compress: bool,
 }
+
+/// What a command that a server `Exception` can end returns: the exception comes back with
+/// the transport, since the connection is idle and reusable afterwards.
+pub(crate) type ServerReply<T> = std::result::Result<T, (ClickhouseTransport, ServerError)>;
 
 /// Line transport
 #[pin_project(project = ClickhouseTransportProj)]
@@ -87,34 +91,76 @@ impl ClickhouseTransport {
         }
     }
 
-    pub(crate) async fn clear(self) -> Result<Self> {
-        if !self.inconsistent {
-            return Ok(self);
+    /// Drains what an abandoned query (a result stream dropped before its end) left on the
+    /// connection in `slot`, so the next command starts in sync with the server.
+    ///
+    /// Cancel-safe: if this future is dropped part-way (a timeout, a `select!`), the transport
+    /// goes back into `slot` still marked `inconsistent`, and the next call drains the rest.
+    /// A read error or a closed socket leaves `slot` empty.
+    pub(crate) async fn clear_in(slot: &mut Option<ClickhouseTransport>) -> Result<()> {
+        match slot {
+            None => return Err(Error::Connection(ConnectionError::Broken)),
+            Some(transport) if !transport.inconsistent => return Ok(()),
+            Some(_) => {}
         }
+        let transport = slot.take().expect("slot checked above");
+        let mut drain = Drain {
+            stream: transport.call(Cmd::Cancel),
+            slot,
+        };
 
-        let mut h = None;
-        let mut stream = self.call(Cmd::Cancel);
-
-        while let Some(packet) = stream.next().await {
+        while let Some(packet) = drain.stream.next().await {
             match packet {
-                Ok(Packet::Pong(inner)) => {
-                    h = Some(inner);
+                // `EndOfStream`, or an `Exception`, is the abandoned query's last packet.
+                Ok(Packet::Eof(mut transport))
+                | Ok(Packet::Exception(mut transport, _))
+                | Ok(Packet::Pong(mut transport)) => {
+                    transport.inconsistent = false;
+                    *drain.slot = Some(transport);
+                    return Ok(());
                 }
-                Ok(Packet::Eof(inner)) => h = Some(inner),
-                // The abandoned query failed; that also ends it, so the connection is idle.
-                Ok(Packet::Exception(_)) => {
-                    h = stream.take_transport();
-                    break;
+                // Each leftover block is decoded in full; yield so a long drain doesn't hold
+                // the executor and a timeout around the caller can fire.
+                Ok(_) => yield_now().await,
+                Err(e) => {
+                    drain.stream.take_transport();
+                    return Err(Error::Io(e));
                 }
-                Err(e) => return Err(Error::Io(e)),
-                _ => {}
             }
         }
 
-        let mut transport = h.ok_or(Error::Driver(DriverError::UnexpectedPacket))?;
-        transport.inconsistent = false;
-        Ok(transport)
+        drain.stream.take_transport();
+        Err(Error::Connection(ConnectionError::Broken))
     }
+}
+
+/// Puts the transport back into the handle when a drain is dropped part-way.
+struct Drain<'a> {
+    stream: PacketStream,
+    slot: &'a mut Option<ClickhouseTransport>,
+}
+
+impl Drop for Drain<'_> {
+    fn drop(&mut self) {
+        if let Some(mut transport) = self.stream.take_transport() {
+            transport.inconsistent = true;
+            *self.slot = Some(transport);
+        }
+    }
+}
+
+/// Returns `Pending` once, after waking the task, so other tasks get to run.
+async fn yield_now() {
+    let mut yielded = false;
+    future::poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
 }
 
 impl<'p> ClickhouseTransportProj<'p> {
@@ -264,7 +310,12 @@ impl Stream for ClickhouseTransport {
 }
 
 impl PacketStream {
-    pub(crate) async fn read_block(mut self) -> Result<(ClickhouseTransport, Option<Block>)> {
+    /// Reads up to the first data block or the end of stream. A server `Exception` also ends
+    /// the exchange: it comes back as the inner `Err`, together with the transport, which is
+    /// idle again and can be reused.
+    pub(crate) async fn read_block(
+        mut self,
+    ) -> Result<ServerReply<(ClickhouseTransport, Option<Block>)>> {
         self.read_block = true;
 
         let mut h = None;
@@ -273,14 +324,18 @@ impl PacketStream {
             match package {
                 Ok(Packet::Eof(inner)) => h = Some(inner),
                 Ok(Packet::Block(block)) => b = Some(block),
-                Ok(Packet::Exception(e)) => return Err(Error::Server(e)),
-                Ok(Packet::TableColumns(_)) => (),
+                Ok(Packet::Exception(inner, e)) => return Ok(Err((inner, e))),
+                // The server reports progress and an execution profile while it runs an INSERT.
+                Ok(Packet::TableColumns(_))
+                | Ok(Packet::Progress(_))
+                | Ok(Packet::ProfileInfo(_)) => (),
                 Err(e) => return Err(Error::Io(e)),
                 _ => return Err(Error::Driver(DriverError::UnexpectedPacket)),
             }
         }
 
-        Ok((h.unwrap(), b))
+        let h = h.ok_or(Error::Connection(ConnectionError::Broken))?;
+        Ok(Ok((h, b)))
     }
 
     pub(crate) fn take_transport(&mut self) -> Option<ClickhouseTransport> {

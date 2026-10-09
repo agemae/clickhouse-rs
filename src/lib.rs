@@ -110,15 +110,13 @@
 
 use std::{fmt, future::Future, time::Duration};
 
-use futures_util::{
-    future, future::BoxFuture, future::FutureExt, stream, stream::BoxStream, StreamExt,
-};
+use futures_util::{future::TryFutureExt, stream::BoxStream, StreamExt};
 use log::{info, warn};
 
 use crate::{
     connecting_stream::ConnectingStream,
     errors::{DriverError, Error, Result},
-    io::ClickhouseTransport,
+    io::{transport::ServerReply, ClickhouseTransport},
     retry_guard::retry_guard,
     types::{
         block::{ChunkIterator, INSERT_BLOCK_SIZE},
@@ -306,7 +304,8 @@ impl ClientHandle {
                     h = Some(inner);
                     info = Some(server_info);
                 }
-                Ok(Packet::Exception(e)) => return Err(Error::Server(e)),
+                // A failed handshake leaves nothing worth reusing.
+                Ok(Packet::Exception(_, e)) => return Err(Error::Server(e)),
                 Err(e) => return Err(Error::Io(e)),
                 _ => return Err(Error::Driver(DriverError::UnexpectedPacket)),
             }
@@ -331,8 +330,8 @@ impl ClientHandle {
 
                 let mut h = None;
 
-                let transport = self.get_inner()?.clear().await?;
-                let mut stream = transport.call(Cmd::Ping);
+                ClickhouseTransport::clear_in(&mut self.inner).await?;
+                let mut stream = self.get_inner()?.call(Cmd::Ping);
 
                 while let Some(packet) = stream.next().await {
                     match packet {
@@ -340,7 +339,10 @@ impl ClientHandle {
                             info!("[pong]");
                             h = Some(inner);
                         }
-                        Ok(Packet::Exception(e)) => return Err(Error::Server(e)),
+                        Ok(Packet::Exception(inner, e)) => {
+                            self.inner = Some(inner);
+                            return Err(Error::Server(e));
+                        }
                         Err(e) => return Err(Error::Io(e)),
                         _ => return Err(Error::Driver(DriverError::UnexpectedPacket)),
                     }
@@ -361,6 +363,11 @@ impl ClientHandle {
 
     /// `ProfileInfo` of the last [`query`](Self::query) result on this handle that was read to
     /// end of stream (`fetch_all`, or `stream`/`stream_blocks` drained to `None`).
+    ///
+    /// The server sends `ProfileInfo` after the last data block, so a caller that stops reading
+    /// once it has the rows it wants (for example with `.take(n)`) never gets it: poll the
+    /// stream until it returns `None`. Stopping early also leaves the rest of the result on the
+    /// connection, which the next command on the handle has to drain first.
     ///
     /// Cleared when the next `query`, `execute` or `insert` starts. Stays `None` if the result
     /// failed, was dropped or timed out before end of stream, or the server sent no
@@ -386,12 +393,11 @@ impl ClientHandle {
     where
         Query: From<Q>,
     {
-        let transport = self.execute_(sql).await?;
-        self.inner = Some(transport);
-        Ok(())
+        let reply = self.execute_(sql).await?;
+        self.finish(reply)
     }
 
-    async fn execute_<Q>(&mut self, sql: Q) -> Result<ClickhouseTransport>
+    async fn execute_<Q>(&mut self, sql: Q) -> Result<ServerReply<ClickhouseTransport>>
     where
         Query: From<Q>,
     {
@@ -408,11 +414,8 @@ impl ClientHandle {
                     let transport = c.get_inner();
 
                     async move {
-                        let transport = transport?;
                         let mut h = None;
-
-                        let transport = transport.clear().await?;
-                        let mut stream = transport.call(Cmd::SendQuery(query, context.clone()));
+                        let mut stream = transport?.call(Cmd::SendQuery(query, context.clone()));
 
                         while let Some(packet) = stream.next().await {
                             match packet {
@@ -420,13 +423,14 @@ impl ClientHandle {
                                 Ok(Packet::Block(_))
                                 | Ok(Packet::ProfileInfo(_))
                                 | Ok(Packet::Progress(_)) => (),
-                                Ok(Packet::Exception(e)) => return Err(Error::Server(e)),
+                                Ok(Packet::Exception(inner, e)) => return Ok(Err((inner, e))),
                                 Err(e) => return Err(Error::Io(e)),
                                 _ => return Err(Error::Driver(DriverError::UnexpectedPacket)),
                             }
                         }
 
-                        Ok(h.unwrap())
+                        let h = h.ok_or(Error::Connection(ConnectionError::Broken))?;
+                        Ok(Ok(h))
                     }
                 })
                 .await
@@ -436,6 +440,21 @@ impl ClientHandle {
         .await
     }
 
+    /// Puts the connection back on the handle after `execute` or `insert`. A server
+    /// `Exception` ends the command but leaves the connection usable, so it goes back too.
+    fn finish(&mut self, reply: ServerReply<ClickhouseTransport>) -> Result<()> {
+        match reply {
+            Ok(transport) => {
+                self.inner = Some(transport);
+                Ok(())
+            }
+            Err((transport, e)) => {
+                self.inner = Some(transport);
+                Err(Error::Server(e))
+            }
+        }
+    }
+
     /// Convenience method to insert block of data.
     pub async fn insert<Q, B>(&mut self, table: Q, block: B) -> Result<()>
     where
@@ -443,12 +462,15 @@ impl ClientHandle {
         B: AsRef<Block>,
     {
         let query = Self::make_query(table, block.as_ref())?;
-        let transport = self.insert_(query.clone(), block.as_ref()).await?;
-        self.inner = Some(transport);
-        Ok(())
+        let reply = self.insert_(query.clone(), block.as_ref()).await?;
+        self.finish(reply)
     }
 
-    async fn insert_(&mut self, query: Query, block: &Block) -> Result<ClickhouseTransport> {
+    async fn insert_(
+        &mut self,
+        query: Query,
+        block: &Block,
+    ) -> Result<ServerReply<ClickhouseTransport>> {
         let timeout = try_opt!(self.context.options.get())
             .insert_timeout
             .unwrap_or_else(|| Duration::from_secs(0));
@@ -462,15 +484,28 @@ impl ClientHandle {
                     let transport = c.get_inner();
 
                     async move {
-                        let transport = transport?.clear().await?;
-                        let (transport, dst_block) =
-                            Self::send_insert_query_(transport, context.clone(), query.clone())
-                                .await?;
+                        let (transport, dst_block) = match Self::send_insert_query_(
+                            transport?,
+                            context.clone(),
+                            query.clone(),
+                        )
+                        .await?
+                        {
+                            Ok(sent) => sent,
+                            Err(failed) => return Ok(Err(failed)),
+                        };
                         let casted_block = block.cast_to(&dst_block)?;
                         let mut chunks = casted_block.chunks(INSERT_BLOCK_SIZE);
-                        let transport =
-                            Self::insert_block_(transport, context.clone(), chunks.next().unwrap())
-                                .await?;
+                        let transport = match Self::insert_block_(
+                            transport,
+                            context.clone(),
+                            chunks.next().unwrap(),
+                        )
+                        .await?
+                        {
+                            Ok(transport) => transport,
+                            Err(failed) => return Ok(Err(failed)),
+                        };
                         Self::insert_tail_(transport, context, query, chunks).await
                     }
                 })
@@ -486,37 +521,50 @@ impl ClientHandle {
         context: Context,
         query: Query,
         chunks: ChunkIterator<Simple>,
-    ) -> Result<ClickhouseTransport> {
+    ) -> Result<ServerReply<ClickhouseTransport>> {
         for chunk in chunks {
             let (transport_, _) =
-                Self::send_insert_query_(transport, context.clone(), query.clone()).await?;
-            transport = Self::insert_block_(transport_, context.clone(), chunk).await?;
+                match Self::send_insert_query_(transport, context.clone(), query.clone()).await? {
+                    Ok(sent) => sent,
+                    Err(failed) => return Ok(Err(failed)),
+                };
+            transport = match Self::insert_block_(transport_, context.clone(), chunk).await? {
+                Ok(transport) => transport,
+                Err(failed) => return Ok(Err(failed)),
+            };
         }
-        Ok(transport)
+        Ok(Ok(transport))
     }
 
     async fn send_insert_query_(
         transport: ClickhouseTransport,
         context: Context,
         query: Query,
-    ) -> Result<(ClickhouseTransport, Block)> {
+    ) -> Result<ServerReply<(ClickhouseTransport, Block)>> {
         let stream = transport.call(Cmd::SendQuery(query, context));
-        let (transport, b) = stream.read_block().await?;
-        let dst_block = b.unwrap();
-        Ok((transport, dst_block))
+        Ok(match stream.read_block().await? {
+            Ok((transport, b)) => {
+                let dst_block = b.ok_or(Error::Driver(DriverError::UnexpectedPacket))?;
+                Ok((transport, dst_block))
+            }
+            Err(failed) => Err(failed),
+        })
     }
 
     async fn insert_block_(
         transport: ClickhouseTransport,
         context: Context,
         block: Block,
-    ) -> Result<ClickhouseTransport> {
+    ) -> Result<ServerReply<ClickhouseTransport>> {
         let send_cmd = Cmd::Union(
             Box::new(Cmd::SendData(block, context.clone())),
             Box::new(Cmd::SendData(Block::default(), context)),
         );
-        let (transport, _) = transport.call(send_cmd).read_block().await?;
-        Ok(transport)
+        Ok(transport
+            .call(send_cmd)
+            .read_block()
+            .await?
+            .map(|(transport, _)| transport))
     }
 
     fn make_query<Q>(table: Q, block: &Block) -> Result<Query>
@@ -537,13 +585,10 @@ impl ClientHandle {
         R: Future<Output = Result<T>>,
         T: 'static,
     {
-        // `execute` and `insert` start here, so this is where they clear the last ProfileInfo.
+        // `execute` and `insert` start here, so this is where they clear the last ProfileInfo
+        // and drain anything a dropped result stream left on the connection.
         self.last_profile_info = None;
-        // let ping_before_query = try_opt!(self.context.options.get()).ping_before_query;
-
-        // if ping_before_query {
-        //     self.check_connection().await?;
-        // }
+        ClickhouseTransport::clear_in(&mut self.inner).await?;
         f(self).await
     }
 
@@ -554,36 +599,7 @@ impl ClientHandle {
     {
         // Every `query` result stream starts here; `BlockStream` sets the value on end of stream.
         self.last_profile_info = None;
-        // let ping_before_query = match self.context.options.get() {
-        //     Ok(val) => val.ping_before_query,
-        //     Err(err) => return Box::pin(stream::once(future::err(err))),
-        // };
-
-        // if ping_before_query {
-        //     let fut: BoxFuture<'a, BoxStream<'a, Result<Block>>> = Box::pin(async move {
-        //         let inner: BoxStream<'a, Result<Block>> = match self.check_connection().await {
-        //             Ok(_) => match f(self) {
-        //                 Ok(s) => Box::pin(s),
-        //                 Err(err) => Box::pin(stream::once(future::err(err))),
-        //             },
-        //             Err(err) => Box::pin(stream::once(future::err(err))),
-        //         };
-        //         inner
-        //     });
-
-        //     Box::pin(fut.flatten_stream())
-        // } else {
-        let fut = f(self);
-        Box::pin(
-            async move {
-                match fut.await {
-                    Ok(s) => s.boxed(),
-                    Err(err) => stream::once(future::err(err)).boxed(),
-                }
-            }
-            .flatten_stream(),
-        )
-        // }
+        Box::pin(f(self).try_flatten_stream())
     }
 
     fn get_inner(&mut self) -> Result<ClickhouseTransport> {
