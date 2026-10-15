@@ -502,12 +502,12 @@ impl Options {
     }
 
     property! {
-        /// Timeout for insert (defaults to `180,000 ms`).
+        /// Timeout for insert (defaults to `180,000 ms`). `None` means no timeout.
         => insert_timeout: Option<Duration>
     }
 
     property! {
-        /// Timeout for execute (defaults to `180 sec`).
+        /// Timeout for execute (defaults to `180 sec`). `None` means no timeout.
         => execute_timeout: Option<Duration>
     }
 

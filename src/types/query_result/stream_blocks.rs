@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     io::ErrorKind,
     pin::Pin,
     task::{self, Poll},
@@ -30,7 +29,8 @@ pub(crate) enum BlockStreamState {
     Reading,
     /// Completely finished reading from block packet stream; connection is now idle
     Finished,
-    /// There was an error reading packet; transport is broken
+    /// There was an error reading packet; transport is broken. The error was already returned,
+    /// so the stream ends.
     Error,
 }
 
@@ -75,12 +75,9 @@ impl<'a> Stream for BlockStream<'a> {
         loop {
             match self.state {
                 BlockStreamState::Reading => {}
-                BlockStreamState::Finished => return Poll::Ready(None),
-                BlockStreamState::Error => {
-                    return Poll::Ready(Some(Err(Error::Other(Cow::Borrowed(
-                        "Attempt to read from broken transport",
-                    )))))
-                }
+                // Every transition into `Error` returns its own error first. Ending the stream
+                // afterwards lets loops that skip errors finish instead of spinning forever.
+                BlockStreamState::Finished | BlockStreamState::Error => return Poll::Ready(None),
             };
 
             let packet = match self.inner.poll_next_unpin(cx) {

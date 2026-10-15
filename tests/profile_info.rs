@@ -121,20 +121,31 @@ mod wire {
         out
     }
 
-    /// A Data packet with one uncompressed `UInt64` column.
-    pub fn data_block(column: &str, values: &[u64]) -> Vec<u8> {
+    /// The start of a Data packet with one uncompressed column, up to the column's values.
+    fn block_header(column: &str, type_name: &str, rows: usize) -> Vec<u8> {
         let mut out = vec![1];
         string("", &mut out);
         // Block info: is_overflows = false, bucket_num = -1, end.
         out.extend_from_slice(&[1, 0, 2, 0xff, 0xff, 0xff, 0xff, 0]);
         varint(1, &mut out);
-        varint(values.len() as u64, &mut out);
+        varint(rows as u64, &mut out);
         string(column, &mut out);
-        string("UInt64", &mut out);
+        string(type_name, &mut out);
+        out
+    }
+
+    /// A Data packet with one uncompressed `UInt64` column.
+    pub fn data_block(column: &str, values: &[u64]) -> Vec<u8> {
+        let mut out = block_header(column, "UInt64", values.len());
         for v in values {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
+    }
+
+    /// A Data packet with a column type this crate can't decode; it fails on the type name.
+    pub fn unsupported_block() -> Vec<u8> {
+        block_header("v", "Variant(String, UInt8)", 1)
     }
 }
 
@@ -148,7 +159,8 @@ async fn fake_server(script: Vec<(u8, Vec<u8>)>) -> String {
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buf = vec![0; 1 << 16];
-        socket.read(&mut buf).await.unwrap();
+        let hello = socket.read(&mut buf).await.unwrap();
+        assert!(hello > 0, "the client closed before its hello");
         socket.write_all(&wire::hello()).await.unwrap();
         let mut script = script.into_iter();
         'connection: while let Ok(n) = socket.read(&mut buf).await {
@@ -338,6 +350,28 @@ async fn ping_after_dropped_stream_keeps_handle_usable() -> Result<()> {
     client.ping().await?;
 
     assert_eq!(fetch_u64s(&mut client, "SELECT 42 :: UInt64").await?, [42]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_after_dropped_stream_keeps_handle_usable() -> Result<()> {
+    let mut client = connect().await?;
+    client
+        .execute("CREATE TEMPORARY TABLE profile_info_after_drop (x UInt64)")
+        .await?;
+
+    drop_stream_after_first_row(&mut client).await?;
+    client
+        .insert(
+            "profile_info_after_drop",
+            Block::new().column("x", vec![1_u64, 2, 3]),
+        )
+        .await?;
+
+    assert_eq!(
+        fetch_u64s(&mut client, "SELECT sum(x) FROM profile_info_after_drop").await?,
+        [6]
+    );
     Ok(())
 }
 
@@ -581,6 +615,22 @@ async fn failed_insert_keeps_handle_usable() -> Result<()> {
         .await;
     assert!(constraint.is_err());
     assert_eq!(fetch_u64s(&mut client, "SELECT 42 :: UInt64").await?, [42]);
+
+    // Rejected by the client after the server accepted the query and sent the table's
+    // header: `cast_to` doesn't widen `Int32` to `UInt64`. The next command cancels the INSERT.
+    let cast = client
+        .insert(
+            "profile_info_checked",
+            Block::new().column("x", vec![1_i32]),
+        )
+        .await;
+    assert!(cast.is_err());
+    assert_eq!(fetch_u64s(&mut client, "SELECT 42 :: UInt64").await?, [42]);
+
+    assert_eq!(
+        fetch_u64s(&mut client, "SELECT count() FROM profile_info_checked").await?,
+        [0]
+    );
     Ok(())
 }
 
@@ -595,6 +645,42 @@ async fn decode_error_drops_the_connection_instead_of_failing_the_next_query() -
     assert!(failed.is_err());
 
     let next = client.query("SELECT 42 :: UInt64").fetch_all().await;
+    let message = next.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(message.contains("Connection broken"), "{message}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn decode_error_ends_the_stream() -> Result<()> {
+    let mut client = connect().await?;
+
+    let mut stream = client
+        .query("SELECT 1::Variant(UInt8, String)")
+        .stream_blocks();
+
+    assert!(matches!(stream.next().await, Some(Err(_))));
+    assert!(stream.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn decode_error_while_draining_drops_the_connection() -> Result<()> {
+    // The first query gets no reply, so it's abandoned before it reads anything. The server
+    // answers the `Cancel` with a block this crate can't decode, which the next command's
+    // drain reads. That error belongs to the abandoned query, not the next command.
+    let url = fake_server(vec![
+        (wire::QUERY, vec![]),
+        (wire::CANCEL, wire::unsupported_block()),
+    ])
+    .await;
+    let mut client = Client::connect(Options::from_str(&url)?).await?;
+    abandon_first_query(&mut client).await;
+
+    let next = client.query("SELECT 1").fetch_all().await;
+    let message = next.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(message.contains("Connection broken"), "{message}");
+
+    let next = client.execute("SELECT 1").await;
     let message = next.err().map(|e| e.to_string()).unwrap_or_default();
     assert!(message.contains("Connection broken"), "{message}");
     Ok(())
@@ -632,7 +718,16 @@ async fn deeply_nested_exception_is_rejected_without_overflowing_the_stack() -> 
     let url = fake_server(vec![(wire::QUERY, wire::exception(1, "outer", &nested))]).await;
     let mut client = Client::connect(Options::from_str(&url)?).await?;
 
-    assert!(client.query("SELECT 1").fetch_all().await.is_err());
+    let message = match client.query("SELECT 1").fetch_all().await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected the chain to be rejected"),
+    };
+    assert!(message.contains("nests too deeply"), "{message}");
+
+    // The rest of the chain is still on the connection, so it must not be reused.
+    let next = client.query("SELECT 1").fetch_all().await;
+    let message = next.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(message.contains("Connection broken"), "{message}");
     Ok(())
 }
 
@@ -652,6 +747,30 @@ async fn totals_rows_are_returned_but_not_counted_in_rows() -> Result<()> {
     assert_eq!(block.row_count(), 3, "two rows plus the totals row");
     assert_eq!(info.rows, 2);
     assert_eq!(info.rows_before_limit, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_execute_or_insert_timeout_means_no_timeout() -> Result<()> {
+    let options = Options::from_str(&database_url())?
+        .execute_timeout(None)
+        .insert_timeout(None);
+    let mut client = Client::connect(options).await?;
+
+    client
+        .execute("CREATE TEMPORARY TABLE profile_info_no_timeout (x UInt64)")
+        .await?;
+    client
+        .insert(
+            "profile_info_no_timeout",
+            Block::new().column("x", vec![1_u64, 2, 3]),
+        )
+        .await?;
+
+    assert_eq!(
+        fetch_u64s(&mut client, "SELECT sum(x) FROM profile_info_no_timeout").await?,
+        [6]
+    );
     Ok(())
 }
 

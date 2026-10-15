@@ -12,18 +12,22 @@ use std::{
 };
 
 use chrono_tz::Tz;
-use log::trace;
+use log::{trace, warn};
 
 use pin_project::pin_project;
 
 use crate::{
     binary::Parser,
-    errors::{ConnectionError, DriverError, Error, Result, ServerError},
+    errors::{ConnectionError, DriverError, Error, Result},
     io::{read_to_end::read_to_end, Stream as InnerStream},
     types::{Block, Cmd, Packet},
 };
+#[cfg(feature = "async_std")]
+use async_std::task::yield_now;
 use futures_core::Stream;
-use futures_util::{future, StreamExt};
+use futures_util::StreamExt;
+#[cfg(not(feature = "async_std"))]
+use tokio::task::yield_now;
 
 pub(crate) struct TransportInfo {
     pub(crate) timezone: Option<Tz>,
@@ -31,9 +35,11 @@ pub(crate) struct TransportInfo {
     pub(crate) compress: bool,
 }
 
-/// What a command that a server `Exception` can end returns: the exception comes back with
-/// the transport, since the connection is idle and reusable afterwards.
-pub(crate) type ServerReply<T> = std::result::Result<T, (ClickhouseTransport, ServerError)>;
+/// What a command that can fail without losing the connection returns: the error comes back
+/// with the transport. A server `Exception` leaves the connection idle; a client-side error
+/// partway through a command comes back with the transport marked `inconsistent`, so the next
+/// command's drain ends it.
+pub(crate) type ServerReply<T> = std::result::Result<T, (ClickhouseTransport, Error)>;
 
 /// Line transport
 #[pin_project(project = ClickhouseTransportProj)]
@@ -96,7 +102,8 @@ impl ClickhouseTransport {
     ///
     /// Cancel-safe: if this future is dropped part-way (a timeout, a `select!`), the transport
     /// goes back into `slot` still marked `inconsistent`, and the next call drains the rest.
-    /// A read error or a closed socket leaves `slot` empty.
+    /// A read or decode error, or a closed socket, leaves `slot` empty and returns
+    /// `Connection(Broken)`: the error belongs to the abandoned query, not the caller's command.
     pub(crate) async fn clear_in(slot: &mut Option<ClickhouseTransport>) -> Result<()> {
         match slot {
             None => return Err(Error::Connection(ConnectionError::Broken)),
@@ -124,7 +131,8 @@ impl ClickhouseTransport {
                 Ok(_) => yield_now().await,
                 Err(e) => {
                     drain.stream.take_transport();
-                    return Err(Error::Io(e));
+                    warn!("dropping connection: failed to drain an abandoned query: {e}");
+                    return Err(Error::Connection(ConnectionError::Broken));
                 }
             }
         }
@@ -147,20 +155,6 @@ impl Drop for Drain<'_> {
             *self.slot = Some(transport);
         }
     }
-}
-
-/// Returns `Pending` once, after waking the task, so other tasks get to run.
-async fn yield_now() {
-    let mut yielded = false;
-    future::poll_fn(|cx| {
-        if yielded {
-            return Poll::Ready(());
-        }
-        yielded = true;
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    })
-    .await
 }
 
 impl<'p> ClickhouseTransportProj<'p> {
@@ -324,7 +318,7 @@ impl PacketStream {
             match package {
                 Ok(Packet::Eof(inner)) => h = Some(inner),
                 Ok(Packet::Block(block)) => b = Some(block),
-                Ok(Packet::Exception(inner, e)) => return Ok(Err((inner, e))),
+                Ok(Packet::Exception(inner, e)) => return Ok(Err((inner, Error::Server(e)))),
                 // The server reports progress and an execution profile while it runs an INSERT.
                 Ok(Packet::TableColumns(_))
                 | Ok(Packet::Progress(_))

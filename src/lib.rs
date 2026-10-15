@@ -48,6 +48,8 @@
 //! - `pool_max` - Upper bound of opened connections for `Pool` (defaults to `20`).
 //!
 //! - `ping_before_query` - Ping server every time before execute any query. (defaults to `true`).
+//!   Currently ignored: no ping is sent before queries. Call `ClientHandle::ping` to check a
+//!   pooled handle before reusing it.
 //! - `send_retries` - Count of retry to send request to server. (defaults to `3`).
 //! - `retry_timeout` - Amount of time to wait before next retry. (defaults to `5 sec`).
 //! - `ping_timeout` - Timeout for ping (defaults to `500 ms`).
@@ -401,12 +403,10 @@ impl ClientHandle {
     where
         Query: From<Q>,
     {
-        let timeout = try_opt!(self.context.options.get())
-            .execute_timeout
-            .unwrap_or_else(|| Duration::from_secs(0));
+        let timeout = try_opt!(self.context.options.get()).execute_timeout;
         let context = self.context.clone();
         let query = Query::from(sql);
-        with_timeout(
+        with_opt_timeout(
             async {
                 self.wrap_future(move |c| {
                     info!("[execute query] {}", query.get_sql());
@@ -423,7 +423,9 @@ impl ClientHandle {
                                 Ok(Packet::Block(_))
                                 | Ok(Packet::ProfileInfo(_))
                                 | Ok(Packet::Progress(_)) => (),
-                                Ok(Packet::Exception(inner, e)) => return Ok(Err((inner, e))),
+                                Ok(Packet::Exception(inner, e)) => {
+                                    return Ok(Err((inner, Error::Server(e))))
+                                }
                                 Err(e) => return Err(Error::Io(e)),
                                 _ => return Err(Error::Driver(DriverError::UnexpectedPacket)),
                             }
@@ -441,7 +443,8 @@ impl ClientHandle {
     }
 
     /// Puts the connection back on the handle after `execute` or `insert`. A server
-    /// `Exception` ends the command but leaves the connection usable, so it goes back too.
+    /// `Exception`, or a client-side error that left the connection usable, ends the command
+    /// but the connection goes back too.
     fn finish(&mut self, reply: ServerReply<ClickhouseTransport>) -> Result<()> {
         match reply {
             Ok(transport) => {
@@ -450,7 +453,7 @@ impl ClientHandle {
             }
             Err((transport, e)) => {
                 self.inner = Some(transport);
-                Err(Error::Server(e))
+                Err(e)
             }
         }
     }
@@ -471,20 +474,18 @@ impl ClientHandle {
         query: Query,
         block: &Block,
     ) -> Result<ServerReply<ClickhouseTransport>> {
-        let timeout = try_opt!(self.context.options.get())
-            .insert_timeout
-            .unwrap_or_else(|| Duration::from_secs(0));
+        let timeout = try_opt!(self.context.options.get()).insert_timeout;
 
         let context = self.context.clone();
 
-        with_timeout(
+        with_opt_timeout(
             async {
                 self.wrap_future(move |c| {
                     info!("[insert]     {}", query.get_sql());
                     let transport = c.get_inner();
 
                     async move {
-                        let (transport, dst_block) = match Self::send_insert_query_(
+                        let (mut transport, dst_block) = match Self::send_insert_query_(
                             transport?,
                             context.clone(),
                             query.clone(),
@@ -494,7 +495,16 @@ impl ClientHandle {
                             Ok(sent) => sent,
                             Err(failed) => return Ok(Err(failed)),
                         };
-                        let casted_block = block.cast_to(&dst_block)?;
+                        let casted_block = match block.cast_to(&dst_block) {
+                            Ok(casted_block) => casted_block,
+                            // The server accepted the INSERT and is waiting for data. Hand the
+                            // connection back unfinished so the next command's drain cancels
+                            // the INSERT, instead of losing the connection.
+                            Err(e) => {
+                                transport.inconsistent = true;
+                                return Ok(Err((transport, e)));
+                            }
+                        };
                         let mut chunks = casted_block.chunks(INSERT_BLOCK_SIZE);
                         let transport = match Self::insert_block_(
                             transport,
@@ -620,6 +630,17 @@ fn column_name_to_string(name: &str) -> Result<String> {
     }
 
     Ok(format!("`{name}`"))
+}
+
+/// `None` means no timeout, as for `execute_timeout` and `insert_timeout`.
+async fn with_opt_timeout<F, T>(future: F, timeout: Option<Duration>) -> F::Output
+where
+    F: Future<Output = Result<T>>,
+{
+    match timeout {
+        Some(timeout) => with_timeout(future, timeout).await,
+        None => future.await,
+    }
 }
 
 #[cfg(feature = "async_std")]

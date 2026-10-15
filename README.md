@@ -44,8 +44,8 @@ parameters:
 
 - `connection_timeout` - Timeout for connection (defaults to `500 ms`)
 - `query_timeout` - Timeout for queries (defaults to `180 sec`).
-- `insert_timeout` - Timeout for inserts (defaults to `180 sec`).
-- `execute_timeout` - Timeout for execute (defaults to `180 sec`).
+- `insert_timeout` - Timeout for inserts (defaults to `180 sec`, `none` for no timeout).
+- `execute_timeout` - Timeout for execute (defaults to `180 sec`, `none` for no timeout).
 - `keepalive` - TCP keep alive timeout in milliseconds.
 - `nodelay` - Whether to enable `TCP_NODELAY` (defaults to `true`).
  
@@ -53,6 +53,8 @@ parameters:
 - `pool_max` - Upper bound of opened connections for `Pool` (defaults to `20`).
 
 - `ping_before_query` - Ping server every time before execute any query. (defaults to `true`).
+  Currently ignored: no ping is sent before queries. Call `ClientHandle::ping` to check a
+  pooled handle before reusing it.
 - `send_retries` - Count of retry to send request to server. (defaults to `3`).
 - `retry_timeout` - Amount of time to wait before next retry. (defaults to `5 sec`).
 - `ping_timeout` - Timeout for ping (defaults to `500 ms`).
