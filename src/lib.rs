@@ -443,8 +443,8 @@ impl ClientHandle {
     }
 
     /// Puts the connection back on the handle after `execute` or `insert`. A server
-    /// `Exception`, or a client-side error that left the connection usable, ends the command
-    /// but the connection goes back too.
+    /// `Exception`, or a client-side error after which the command was ended in place, ends
+    /// the command but the connection goes back too.
     fn finish(&mut self, reply: ServerReply<ClickhouseTransport>) -> Result<()> {
         match reply {
             Ok(transport) => {
@@ -497,12 +497,18 @@ impl ClientHandle {
                         };
                         let casted_block = match block.cast_to(&dst_block) {
                             Ok(casted_block) => casted_block,
-                            // The server accepted the INSERT and is waiting for data. Hand the
-                            // connection back unfinished so the next command's drain cancels
-                            // the INSERT, instead of losing the connection.
+                            // The server accepted the INSERT and is waiting for data. Cancel it
+                            // now, while this future still owns the connection, so it isn't left
+                            // open on the server until the handle is reused. If that drain fails,
+                            // the connection is dropped.
                             Err(e) => {
                                 transport.inconsistent = true;
-                                return Ok(Err((transport, e)));
+                                let mut slot = Some(transport);
+                                let _ = ClickhouseTransport::clear_in(&mut slot).await;
+                                return match slot {
+                                    Some(transport) => Ok(Err((transport, e))),
+                                    None => Err(e),
+                                };
                             }
                         };
                         let mut chunks = casted_block.chunks(INSERT_BLOCK_SIZE);

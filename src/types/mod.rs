@@ -86,6 +86,11 @@ pub struct ProfileInfo {
     /// enough rows, so `rows_before_limit > rows` can miss truncated results. Set
     /// `exact_rows_before_limit = 1` on the query for an exact count; the server then reads all
     /// the data before the `LIMIT` instead of stopping early.
+    ///
+    /// That setting isn't enough when the server reads a table in its sorting-key order, for
+    /// example an `ORDER BY` that follows a MergeTree table's sorting key: the server still
+    /// stops early, so this is still a lower bound. Also set `optimize_read_in_order = 0` on
+    /// those queries.
     pub rows_before_limit: u64,
     /// Always `true` from current servers, even without a `LIMIT`. Use `applied_limit` instead.
     pub calculated_rows_before_limit: bool,

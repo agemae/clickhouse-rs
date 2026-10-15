@@ -617,7 +617,7 @@ async fn failed_insert_keeps_handle_usable() -> Result<()> {
     assert_eq!(fetch_u64s(&mut client, "SELECT 42 :: UInt64").await?, [42]);
 
     // Rejected by the client after the server accepted the query and sent the table's
-    // header: `cast_to` doesn't widen `Int32` to `UInt64`. The next command cancels the INSERT.
+    // header: `cast_to` doesn't widen `Int32` to `UInt64`. `insert()` cancels the INSERT.
     let cast = client
         .insert(
             "profile_info_checked",
@@ -631,6 +631,38 @@ async fn failed_insert_keeps_handle_usable() -> Result<()> {
         fetch_u64s(&mut client, "SELECT count() FROM profile_info_checked").await?,
         [0]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cast_error_in_insert_ends_the_insert_on_the_server() -> Result<()> {
+    let mut client = connect().await?;
+    client
+        .execute("CREATE TEMPORARY TABLE profile_info_cast (x UInt64)")
+        .await?;
+
+    let cast = client
+        .insert("profile_info_cast", Block::new().column("x", vec![1_i32]))
+        .await;
+    assert!(cast.is_err());
+
+    // Checked from another connection, before this handle is used again: the INSERT must not
+    // be left open on the server, waiting for data. The server can take a moment to remove a
+    // finished query from `system.processes`, so poll briefly.
+    let mut other = connect().await?;
+    let open_inserts = "SELECT count() FROM system.processes \
+                        WHERE query LIKE 'INSERT INTO profile_info_cast %'";
+    let mut open = fetch_u64s(&mut other, open_inserts).await?;
+    for _ in 0..20 {
+        if open == [0] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        open = fetch_u64s(&mut other, open_inserts).await?;
+    }
+    assert_eq!(open, [0], "the INSERT is still open on the server");
+
+    assert_eq!(fetch_u64s(&mut client, "SELECT 42 :: UInt64").await?, [42]);
     Ok(())
 }
 

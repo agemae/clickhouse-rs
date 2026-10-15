@@ -36,9 +36,8 @@ pub(crate) struct TransportInfo {
 }
 
 /// What a command that can fail without losing the connection returns: the error comes back
-/// with the transport. A server `Exception` leaves the connection idle; a client-side error
-/// partway through a command comes back with the transport marked `inconsistent`, so the next
-/// command's drain ends it.
+/// with the transport, which is idle again. A server `Exception` ends the command on its own;
+/// after a client-side error partway through a command, the command is ended in place first.
 pub(crate) type ServerReply<T> = std::result::Result<T, (ClickhouseTransport, Error)>;
 
 /// Line transport
